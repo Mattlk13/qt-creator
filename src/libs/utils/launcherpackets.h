@@ -99,7 +99,8 @@ public:
     QStringList arguments;
     QString workingDir;
     QStringList env;
-    QProcess::ProcessChannelMode mode = QProcess::SeparateChannels;
+    QIODevice::OpenMode openMode = QIODevice::ReadWrite;
+    QProcess::ProcessChannelMode channelMode = QProcess::SeparateChannels;
 
 private:
     void doSerialize(QDataStream &stream) const override;
@@ -111,7 +112,7 @@ class ProcessStartedPacket : public LauncherPacket
 public:
     ProcessStartedPacket(quintptr token);
 
-    int processId;
+    int processId = 0;
 
 private:
     void doSerialize(QDataStream &stream) const override;
