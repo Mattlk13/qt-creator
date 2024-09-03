@@ -623,20 +623,20 @@ jobs:
 
     steps:
     - name: Download artifact
-      uses: actions/download-artifact@v1
+      uses: actions/download-artifact@v4.1.7
       with:
         name: qtcreator-${{ matrix.config.artifact }}-${{ github.run_id }}.7z
         path: ./
 
     - name: Download Devel artifact
-      uses: actions/download-artifact@v1
+      uses: actions/download-artifact@v4.1.7
       with:
         name: qtcreator-${{ matrix.config.artifact }}-${{ github.run_id }}_dev.7z
         path: ./
 
     - name: Download wininterrupt artifact
       if: contains(matrix.config.artifact, 'Windows')
-      uses: actions/download-artifact@v1
+      uses: actions/download-artifact@v4.1.7
       with:
         name: wininterrupt-${{ matrix.config.artifact }}-${{ github.run_id }}.7z
         path: ./
@@ -656,7 +656,7 @@ jobs:
         path: ./
 
     - name: Download URL
-      uses: actions/download-artifact@v1
+      uses: actions/download-artifact@v4.1.7
       with:
         name: upload_url
         path: ./
