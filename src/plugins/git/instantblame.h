@@ -54,6 +54,9 @@ public:
     void once();
 
 private:
+#ifdef WITH_TESTS
+    friend class InstantBlameTest;
+#endif
     void setupForCurrentEditor();
     bool setEditor(TextEditor::TextEditorWidget *widget);
     void scheduleInstantBlame();
@@ -65,6 +68,7 @@ private:
     bool m_modified = false;
     QMetaObject::Connection m_blameCursorPosConn;
     QMetaObject::Connection m_documentChangedConn;
+    QMetaObject::Connection m_documentContentsChangedConn;
 };
 
 #ifdef WITH_TESTS

@@ -20,6 +20,7 @@
 #include <texteditor/texteditor.h>
 #include <texteditor/textmark.h>
 
+#include <utils/async.h>
 #include <utils/filepath.h>
 #include <utils/icon.h>
 #include <utils/qtcprocess.h>
@@ -38,6 +39,7 @@
 #include <QTimer>
 
 #ifdef WITH_TESTS
+#include <QTemporaryDir>
 #include <QTest>
 #endif
 
@@ -374,6 +376,8 @@ void InstantBlame::setupForCurrentEditor()
                                    this, [this] { m_controller->schedule(500); });
     m_documentChangedConn = connect(m_document, &IDocument::changed,
                                     this, &InstantBlame::slotDocumentChanged);
+    m_documentContentsChangedConn = connect(m_document, &IDocument::contentsChanged,
+                                            this, &InstantBlame::slotDocumentChanged);
     m_modified = m_document->isModified();
 }
 
@@ -404,8 +408,8 @@ bool InstantBlame::setEditor(TextEditorWidget *widget)
     m_controller->setContext(widget, topLevel,
                              m_document->property("GitReference").toString(),
                              workingFilePath.path(), workingFilePath,
-                             /*allowModifiedDocument=*/false,
-                             /*useDocumentContents=*/false);
+                             /*allowModifiedDocument=*/true,
+                             /*useDocumentContents=*/true);
     m_controller->setEnabled(true);
     return true;
 }
@@ -556,6 +560,7 @@ void InstantBlame::stop()
     m_controller->setEnabled(false);
     disconnect(m_blameCursorPosConn);
     disconnect(m_documentChangedConn);
+    disconnect(m_documentContentsChangedConn);
     m_document = nullptr;
     m_modified = false;
 }
@@ -565,13 +570,14 @@ void InstantBlame::slotDocumentChanged()
     if (!m_document) {
         qCWarning(log) << "Document is invalid, disconnecting.";
         disconnect(m_documentChangedConn);
+        disconnect(m_documentContentsChangedConn);
         return;
     }
 
     const bool modified = m_document->isModified();
     qCDebug(log) << "Document is changed, modified:" << modified;
     if (modified) {
-        m_controller->clear();
+        m_controller->schedule(500);
     } else if (m_modified) {
         scheduleInstantBlame();
     }
@@ -707,6 +713,15 @@ void BlameController::loadRepositoryConfiguration()
         });
 }
 
+static void addModifiedLineDiff(BlameMark &mark, const EditorLineDiff &diff)
+{
+    if (!diff.isValid)
+        return;
+    for (const QString &oldLine : diff.oldLines)
+        mark.addOldLine("-" + oldLine);
+    mark.addNewLine("+" + diff.newLine);
+}
+
 void BlameController::perform()
 {
     if (!m_widget || !m_document || m_topLevel.isEmpty()) {
@@ -757,6 +772,7 @@ void BlameController::perform()
     }();
     const QPointer<BlameController> guard(this);
     const Storage<CommitInfo> infoStorage;
+    const Storage<QString> baselineTextStorage;
     const auto blameHandler = [guard, document, generation, workingFilePath, topLevel, line,
                                author, infoStorage](const CommandResult &result) {
         if (!guard || !document || guard->m_requestGeneration != generation)
@@ -803,12 +819,27 @@ void BlameController::perform()
         process.setEncoding(encoding);
         return SetupResult::Continue;
     };
-    const auto onLogDone = [guard, generation](const Process &process) {
+    const auto onLogDone
+        = [guard, generation, infoStorage, baselineTextStorage](const Process &process) {
         if (!guard || guard->m_requestGeneration != generation || !guard->m_blameMark)
             return;
         const QString error = process.cleanedStdErr().trimmed();
-        if (!error.isEmpty())
-            qCWarning(log) << error;
+        if (infoStorage->modified) {
+            if (process.result() == ProcessResult::FinishedWithSuccess) {
+                *baselineTextStorage = process.cleanedStdOut();
+                baselineTextStorage->replace("\r\n", "\n");
+            } else if (!error.contains("does not exist in")
+                       && !error.contains("exists on disk, but not in")
+                       && !error.contains("invalid object name")) {
+                qCWarning(log) << error;
+            }
+            return;
+        }
+        if (process.result() != ProcessResult::FinishedWithSuccess) {
+            if (!error.isEmpty())
+                qCWarning(log) << error;
+            return;
+        }
         static const QRegularExpression re("^[-+][^-+].*");
         const QStringList diffLines = process.cleanedStdOut().split("\n").filter(re);
         for (const QString &diffLine : diffLines) {
@@ -818,12 +849,29 @@ void BlameController::perform()
                 guard->m_blameMark->addNewLine(diffLine);
         }
     };
+    const auto onDiffSetup
+        = [infoStorage, baselineTextStorage, editorText](Async<EditorLineDiff> &async) {
+        if (!infoStorage->modified)
+            return SetupResult::StopWithSuccess;
+        async.setConcurrentCallData(computeEditorLineDiff, *baselineTextStorage,
+                                    editorText, infoStorage->line);
+        return SetupResult::Continue;
+    };
+    const auto onDiffDone = [guard, generation](const Async<EditorLineDiff> &async) {
+        if (!guard || guard->m_requestGeneration != generation || !guard->m_blameMark
+            || !async.isResultAvailable()) {
+            return;
+        }
+        addModifiedLineDiff(*guard->m_blameMark, async.result());
+    };
 
     m_taskTreeRunner.start({
         infoStorage,
+        baselineTextStorage,
         gitClient().commandTask({topLevel, options, RunFlag::NoOutput, {}, encoding,
                                  blameHandler, writeData}),
-        ProcessTask(onLogSetup, onLogDone, CallDoneFlag::OnSuccess),
+        ProcessTask(onLogSetup, onLogDone, CallDoneFlag::Always),
+        AsyncTask<EditorLineDiff>(onDiffSetup, onDiffDone, CallDoneFlag::OnSuccess),
     });
 }
 
@@ -952,22 +1000,28 @@ void InstantBlameTest::testBlameOutputParsing()
 
 void InstantBlameTest::testBlameDocumentContents()
 {
+    const EditorLineDiff insertion
+        = editorLineDiffAgainstEditorText("first\n", "inserted\nfirst\n", 1);
+    QVERIFY(insertion.isValid);
+    QVERIFY(insertion.oldLines.isEmpty());
+    QCOMPARE(insertion.newLine, QString("inserted"));
+
     QTemporaryDir temporaryDir;
     QVERIFY(temporaryDir.isValid());
     const FilePath repo = FilePath::fromString(temporaryDir.path());
     const auto runGit = [repo](const QStringList &arguments) {
         return gitClient().vcsSynchronousExec(repo, arguments).result()
-        == ProcessResult::FinishedWithSuccess;
+               == ProcessResult::FinishedWithSuccess;
     };
     QVERIFY(runGit({"init", "."}));
     QVERIFY(runGit({"config", "user.email", "test@test"}));
     QVERIFY(runGit({"config", "user.name", "test"}));
     QVERIFY(runGit({"config", "commit.gpgsign", "false"}));
     const FilePath file = repo / "file.txt";
-    QVERIFY(file.writeFileContents("committed\n"));
+    QVERIFY(file.writeFileContents("first\ncommitted\n"));
     QVERIFY(runGit({"add", "file.txt"}));
     QVERIFY(runGit({"commit", "-m", "initial"}));
-    QVERIFY(file.writeFileContents("working tree\n"));
+    QVERIFY(file.writeFileContents("first\nworking tree\n"));
 
     bool done = false;
     CommandResult result;
@@ -996,9 +1050,10 @@ void InstantBlameTest::testBlameDocumentContents()
     cursor.movePosition(QTextCursor::NextBlock);
     widget.setTextCursor(cursor);
 
-    BlameController controller;
-    controller.setContext(&widget, repo, {}, "file.txt", file, true, true);
-    controller.setEnabled(true);
+    document->setProperty("GitRepository", repo.path());
+    InstantBlame instantBlame;
+    QVERIFY(instantBlame.setEditor(&widget));
+    instantBlame.scheduleInstantBlame();
 
     const auto markToolTip = [&document](int line) {
         for (const TextMark *mark : document->marks()) {
@@ -1017,7 +1072,7 @@ void InstantBlameTest::testBlameDocumentContents()
     document->document()->setModified(true);
     cursor = QTextCursor(widget.document());
     widget.setTextCursor(cursor);
-    controller.schedule();
+    instantBlame.scheduleInstantBlame();
     QTRY_VERIFY(markToolTip(1).contains("+inserted"));
 
     const QByteArray latin1Contents = "caf\xe9\ncaf\xe9 old\n";
